@@ -1155,6 +1155,85 @@ curl -s -X POST http://another-instance:8080/execution-verifications \
 > 包内的观测与快照），**不冒充来源真实性或对端身份证明**——导出方身份与传输
 > 可信应由调用方在传输/签名层另行保证（响应的 `scope` 字段始终明示这一界限）。
 
+#### 5. 中途改用新计划：接棒 `POST /plan-executions/{execution_id}/handover`
+
+轮换执行**尚未结束**却要改用一份新计划时，已落账的进度不必作废：让原执行
+**最新快照**成为新执行的起点。请求在路径中携带原 `execution_id`，体内携带
+`expected_version`（乐观锁，必须等于原执行当前版本）、**新场景**字段
+（`certificates` / `trust_anchors` / `endpoints` / `relationships` /
+`actions` / `plan_time`，结构同登记接口）以及**至少一段**后续 `plan`
+（阶段从 1 重新编号，规则同登记：动作恰好各排一次，允许空 no-op 阶段）。
+
+服务先在事务外做完整校验，再在**单个 SQLite 事务**内落账，**两者要么同时
+落账，要么都不改变**：
+
+1. **起点一致性（422 `handover_snapshot_mismatch`，逐项列出全部分歧）**
+   - 新场景的初始信任锚集合必须与原执行最新快照的完整锚集合**逐对一致**；
+   - 新场景每个端点的 `current_chain` 必须等于快照中该端点的当前链，
+     端点集合不得增删；
+   - 必保通信关系（client → endpoint）集合必须与快照**逐对一致**；
+   - **沿用的证书 ID 不得改写证书属性**（`subject` / `issuer` /
+     `not_valid_before` / `not_valid_after` 必须原样）；新增证书只能出现在
+     新的目标链与尚未执行的动作里。
+2. **后续计划逐阶段保持通信（409 Failure）**：以该快照为版本 0 起点完整回放
+   新计划，每个阶段后每条通信关系仍须有有效信任路径；失败响应与
+   `/plans/verify` 同形（`stage` 从 1 计），且**不创建**新执行。
+3. **事务守卫（均 409，失败不留任何子记录）**：
+   - `version_conflict`：`expected_version` 与当前版本不符——原执行**刚提交
+     了下一阶段**（版本号已前进），调用方应取最新快照后重试；
+   - `already_handed_over`：**已有接棒先完成**，后来的接棒失败且不留子记录，
+     响应给出已胜出的 `successor_execution_id`；
+   - `execution_finished`：原计划已全部执行完，没有未完成阶段可接棒。
+
+成功后（响应 `201`，即新执行的当前状态）：旧执行标记为
+`lifecycle: "handed_over"`、`next_stage: null` 并登记
+`successor_execution_id`；新执行自身**版本为 0**，版本 0 初始快照就是旧执行
+最新快照（相同的信任锚、端点当前链与全部有效关系，按新场景的证书元数据重建），
+并登记 `predecessor_execution_id` / `predecessor_version` 指向来源。
+
+```bash
+EID=9f2c...e1   # 原执行；假设其阶段 1 已提交（当前 version=1）
+
+# 以阶段 1 后的快照为起点接棒：新场景初始同时信任 root-old/root-new、
+# 端点仍提供旧链；后续先增信第二新根，再换最新叶子并撤掉前两个根。
+curl -s -X POST "http://localhost:8080/plan-executions/$EID/handover" \
+  -H 'Content-Type: application/json' \
+  --data @examples/execution_handover_request.json
+```
+
+请求体示例见
+[`examples/execution_handover_request.json`](examples/execution_handover_request.json)
+（与 `execution_register_request.json` + 阶段 1 提交后的快照严格衔接，可直接
+照「登记 → 提交阶段 1 → 接棒」顺序执行）。
+
+**接棒后的旧执行**：
+
+- **不能再提交未完成阶段**：对旧执行提交其下一阶段返回
+  `409 execution_handed_over`（旧执行版本不前进、不追加快照）；
+- **已提交阶段的同内容重试仍按原规则处理**：以当前版本号、完全相同的内容
+  重试已落账阶段，照旧幂等返回同一份快照；过期 `expected_version` 仍先返回
+  `409 version_conflict`；
+- 旧执行**及其导出仍可读取、异地核验**：`GET` 与 `/export` 照常，导出包带
+  `lifecycle: "handed_over"` 与 `successor_execution_id`（去向）；新执行的
+  状态与导出带 `predecessor_execution_id` / `predecessor_version`（来源），
+  两边查询都可追踪谱系；`POST /execution-verifications` 的结论同样镜像这些
+  字段。旧执行未完成的计划在接棒后视为终止：其导出包 `next_stage` 为
+  `null`，核验方在 `lifecycle: "handed_over"` 时接受这一点（已核验版本数、
+  快照与回放结论不受影响）。
+- 接棒可以**跨代串联**：新执行自己也可在未完成时再次接棒；每一代只记录
+  直接前驱与直接后继，谱系不被改写。
+
+| 接棒失败码 | HTTP | 含义 |
+| --- | --- | --- |
+| `version_conflict` | 409 | `expected_version` 落后：原执行刚提交了下一阶段；无子记录 |
+| `already_handed_over` | 409 | 已有接棒先完成（给出 `successor_execution_id`）；后来者不留子记录 |
+| `execution_finished` | 409 | 原计划已执行完，无可接棒的未完成阶段 |
+| Failure（`untrusted_root` 等） | 409 | 后续计划某阶段破坏通信关系，或动作排在未授权阶段；同 `/plans/verify` |
+| `handover_snapshot_mismatch` | 422 | 新场景起点（锚/链/关系/沿用证书属性）与最新快照不一致，逐项列出 |
+
+普通登记（`POST /plan-executions`）与阶段提交（`POST .../stages`）接口保持
+不变；接棒只是为未完成执行增加一条「快照 → 新执行版本 0」的事务性续跑通道。
+
 ## 请求模型
 
 | 字段 | 说明 |

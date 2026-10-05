@@ -24,6 +24,18 @@ instead of failing; different content for the same stage always returns 409.
 
 The plan and every snapshot are immutable; the only mutable fields of an
 execution are its current version and the strictly appended snapshots.
+
+Handover (接棒): when a rotation still in progress must switch plans,
+``POST /plan-executions/{id}/handover`` marks the original execution
+``handed_over`` **and** registers a successor at version 0 in one transaction.
+The successor's version-0 snapshot is the original execution's latest snapshot,
+so the progress already on the books is its starting point; both effects land
+atomically. A handover whose ``expected_version`` is stale (the original
+execution committed another stage first) or that arrives second (a successor
+already exists) is rejected without creating any child. Afterwards the old
+execution cannot commit an unfinished stage, while an already-committed stage's
+identical retry stays idempotent; both executions stay readable/exportable and
+carry predecessor/successor lineage.
 """
 from __future__ import annotations
 
@@ -56,6 +68,10 @@ from .models import (
     ExecutionStage,
     ExecutionStatus,
     Failure,
+    HandoverConsistencyDetail,
+    HandoverConflict,
+    HandoverMismatchItem,
+    HandoverRequest,
     PlannedStage,
     PlanRequest,
     RelationshipRef,
@@ -73,6 +89,10 @@ CREATE TABLE IF NOT EXISTS plan_executions (
     plan_json       TEXT NOT NULL,
     stage_count     INTEGER NOT NULL,
     current_version INTEGER NOT NULL,
+    lifecycle       TEXT NOT NULL DEFAULT 'active',
+    successor_id    TEXT,
+    predecessor_id  TEXT,
+    predecessor_version INTEGER,
     created_at      TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS stage_commits (
@@ -87,6 +107,15 @@ CREATE TABLE IF NOT EXISTS stage_commits (
     FOREIGN KEY (execution_id) REFERENCES plan_executions(execution_id)
 );
 """
+
+# Columns added after the first archive release; applied idempotently to SQLite
+# files created by the older schema so existing stores migrate transparently.
+_ADDED_COLUMNS = (
+    ("lifecycle", "TEXT NOT NULL DEFAULT 'active'"),
+    ("successor_id", "TEXT"),
+    ("predecessor_id", "TEXT"),
+    ("predecessor_version", "INTEGER"),
+)
 
 
 class ExecutionReplayError(Exception):
@@ -111,6 +140,26 @@ class UnknownExecution(Exception):
     def __init__(self, execution_id: str) -> None:
         super().__init__(f"unknown execution_id '{execution_id}'")
         self.execution_id = execution_id
+
+
+class HandoverRejected(Exception):
+    """A handover failed one of its transactional guards (HTTP 409).
+
+    The rejected handover never inserts a successor row: there is no child
+    record to clean up.
+    """
+
+    def __init__(self, conflict: "HandoverConflict") -> None:  # type: ignore[name-defined]
+        super().__init__(conflict.message)
+        self.conflict = conflict
+
+
+class HandoverConsistencyError(Exception):
+    """The new scenario does not start at the original snapshot (HTTP 422)."""
+
+    def __init__(self, detail: "HandoverConsistencyDetail") -> None:  # type: ignore[name-defined]
+        super().__init__(detail.message)
+        self.detail = detail
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +190,17 @@ def _connect() -> sqlite3.Connection:
             if path not in _initialized:
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.executescript(SCHEMA)
+                existing = {
+                    r["name"]
+                    for r in conn.execute(
+                        "PRAGMA table_info(plan_executions)"
+                    ).fetchall()
+                }
+                for column, decl in _ADDED_COLUMNS:
+                    if column not in existing:
+                        conn.execute(
+                            f"ALTER TABLE plan_executions ADD COLUMN {column} {decl}"
+                        )
                 _initialized.add(path)
     return conn
 
@@ -370,14 +430,23 @@ def _status_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ExecutionSta
     version = row["current_version"]
     stage_count = row["stage_count"]
     completed = [s.stage for s in snapshots if s.stage >= 1]
+    lifecycle = row["lifecycle"]
+    handed_over = lifecycle == "handed_over"
     finished = version >= stage_count
+    # A handed-over execution cannot commit further stages even when its own
+    # plan was not finished: next_stage is null for both terminal states.
+    next_stage = None if (finished or handed_over) else version + 1
     return ExecutionStatus(
         execution_id=row["execution_id"],
+        lifecycle=lifecycle,  # type: ignore[arg-type]
         version=version,
         stage_count=stage_count,
         completed_stages=completed,
-        next_stage=None if finished else version + 1,
+        next_stage=next_stage,
         finished=finished,
+        successor_execution_id=row["successor_id"],
+        predecessor_execution_id=row["predecessor_id"],
+        predecessor_version=row["predecessor_version"],
         snapshots=snapshots,
     )
 
@@ -476,13 +545,18 @@ def export_execution(execution_id: str) -> "ExecutionExport":
         )
 
     finished = version >= stage_count
+    handed_over = row["lifecycle"] == "handed_over"
     return ExecutionExport(
         execution_id=row["execution_id"],
+        lifecycle=row["lifecycle"],  # type: ignore[arg-type]
         version=version,
         stage_count=stage_count,
         completed_stages=list(range(1, version + 1)),
-        next_stage=None if finished else version + 1,
+        next_stage=None if (finished or handed_over) else version + 1,
         finished=finished,
+        successor_execution_id=row["successor_id"],
+        predecessor_execution_id=row["predecessor_id"],
+        predecessor_version=row["predecessor_version"],
         created_at=datetime.fromisoformat(row["created_at"]),
         scenario=scenario,
         plan=plan,
@@ -538,7 +612,9 @@ def register_execution(req: ExecutionRegisterRequest) -> ExecutionStatus:
         conn.execute(
             "INSERT INTO plan_executions "
             "(execution_id, scenario_json, plan_json, stage_count, "
-            "current_version, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+            "current_version, lifecycle, successor_id, predecessor_id, "
+            "predecessor_version, created_at) "
+            "VALUES (?, ?, ?, ?, 0, 'active', NULL, NULL, NULL, ?)",
             (
                 execution_id,
                 scenario_blob,
@@ -725,6 +801,24 @@ def commit_stage(
                     f"with different content is forbidden (the audit record "
                     f"is immutable). Re-send the identical commit to receive "
                     f"the same snapshot.",
+                    expected_version=current_version,
+                    current_version=current_version,
+                    stage=stage,
+                )
+            )
+
+        # -- handed over? no unfinished stage may land on the old execution --
+        # An already-committed stage is handled above (idempotent replay), so a
+        # request reaching here is for a not-yet-committed stage, which must
+        # fail now that a successor continues from this execution's snapshot.
+        if row["lifecycle"] == "handed_over":
+            raise CommitRejected(
+                _conflict(
+                    "execution_handed_over",
+                    f"execution '{execution_id}' has been handed over to "
+                    f"successor '{row['successor_id']}' at version "
+                    f"{current_version}; commit the remaining stages against "
+                    f"the successor instead.",
                     expected_version=current_version,
                     current_version=current_version,
                     stage=stage,
@@ -941,3 +1035,571 @@ def commit_stage(
         conn.close()
 
     return get_execution(execution_id)
+
+
+# ---------------------------------------------------------------------------
+# Handover (接棒): continue an unfinished execution under a new plan
+#
+# When a rotation still in progress must switch to a new plan, the progress
+# already on the books becomes the new execution's starting point. One SQLite
+# transaction both flips the original execution to lifecycle 'handed_over' and
+# registers the successor at version 0, whose initial snapshot is copied from
+# the original execution's latest snapshot. Either both land or neither does;
+# a losing concurrent handover fails without inserting any child row.
+# ---------------------------------------------------------------------------
+
+
+def _state_from_snapshot(snapshot: StageSnapshot) -> TrustState:
+    """Rebuild the engine TrustState captured by a stored snapshot."""
+
+    return TrustState(
+        anchors=frozenset(
+            TrustEdge(a.client_id, a.anchor_cert_id)
+            for a in snapshot.trust_anchors
+        ),
+        chains={
+            ep.endpoint_id: list(ep.chain) for ep in snapshot.endpoint_chains
+        },
+    )
+
+
+def _utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def _cert_attribute_mismatches(
+    parent_req: PlanRequest, child_req: HandoverRequest
+) -> list[HandoverMismatchItem]:
+    """A reused cert_id must carry identical attributes in the new scenario."""
+
+    parent_certs = {c.cert_id: c for c in parent_req.certificates}
+    mismatches: list[HandoverMismatchItem] = []
+    for c in sorted(child_req.certificates, key=lambda x: x.cert_id):
+        old = parent_certs.get(c.cert_id)
+        if old is None:
+            continue  # newly introduced certificate: nothing to rewrite against
+        attrs: list[tuple[str, Any, Any]] = [
+            ("subject", old.subject, c.subject),
+            ("issuer", old.issuer, c.issuer),
+            ("not_valid_before", _utc(old.not_valid_before),
+             _utc(c.not_valid_before)),
+            ("not_valid_after", _utc(old.not_valid_after),
+             _utc(c.not_valid_after)),
+        ]
+        diverged = [name for name, want, got in attrs if want != got]
+        if diverged:
+            details = {
+                name: [want.isoformat() if hasattr(want, "isoformat") else want,
+                       got.isoformat() if hasattr(got, "isoformat") else got]
+                for name, want, got in attrs if name in diverged
+            }
+            mismatches.append(
+                HandoverMismatchItem(
+                    component="certificate",
+                    message=(
+                        f"reused certificate '{c.cert_id}' must keep its "
+                        f"original attributes; changed: "
+                        f"{', '.join(diverged)}"
+                    ),
+                    cert_id=c.cert_id,
+                    attribute=",".join(diverged),
+                    expected={k: v[0] for k, v in details.items()},
+                    found={k: v[1] for k, v in details.items()},
+                )
+            )
+    return mismatches
+
+
+def _starting_point_mismatches(
+    parent_req: PlanRequest,
+    child_req: HandoverRequest,
+    snapshot: StageSnapshot,
+) -> list[HandoverMismatchItem]:
+    """Every way the new scenario fails to start exactly at ``snapshot``."""
+
+    mismatches: list[HandoverMismatchItem] = []
+
+    # Initial trust anchors must equal the snapshot's complete anchor set.
+    snapshot_anchors = sorted(
+        (a.client_id, a.anchor_cert_id) for a in snapshot.trust_anchors
+    )
+    child_anchors = sorted(
+        (a.client_id, a.cert_id) for a in child_req.trust_anchors
+    )
+    if child_anchors != snapshot_anchors:
+        only_snapshot = sorted(set(snapshot_anchors) - set(child_anchors))
+        only_child = sorted(set(child_anchors) - set(snapshot_anchors))
+        for client_id, anchor_cert_id in only_snapshot:
+            mismatches.append(
+                HandoverMismatchItem(
+                    component="trust_anchors",
+                    message=(
+                        f"new scenario is missing the snapshot's trust anchor "
+                        f"({client_id}, {anchor_cert_id})"
+                    ),
+                    client_id=client_id,
+                    anchor_cert_id=anchor_cert_id,
+                    expected={"present": True},
+                    found={"present": False},
+                )
+            )
+        for client_id, anchor_cert_id in only_child:
+            mismatches.append(
+                HandoverMismatchItem(
+                    component="trust_anchors",
+                    message=(
+                        f"new scenario declares an initial trust anchor "
+                        f"({client_id}, {anchor_cert_id}) absent from the "
+                        f"snapshot"
+                    ),
+                    client_id=client_id,
+                    anchor_cert_id=anchor_cert_id,
+                    expected={"present": False},
+                    found={"present": True},
+                )
+            )
+
+    # Every endpoint's current chain must be the chain served in the snapshot.
+    snapshot_chains = {
+        ep.endpoint_id: list(ep.chain) for ep in snapshot.endpoint_chains
+    }
+    child_endpoints = {ep.endpoint_id: ep for ep in child_req.endpoints}
+    for endpoint_id in sorted(set(snapshot_chains) | set(child_endpoints)):
+        if endpoint_id not in child_endpoints:
+            mismatches.append(
+                HandoverMismatchItem(
+                    component="endpoint_chains",
+                    message=(
+                        f"new scenario drops endpoint '{endpoint_id}' that "
+                        f"serves a chain in the snapshot"
+                    ),
+                    endpoint_id=endpoint_id,
+                    expected=snapshot_chains.get(endpoint_id),
+                    found=None,
+                )
+            )
+            continue
+        if endpoint_id not in snapshot_chains:
+            mismatches.append(
+                HandoverMismatchItem(
+                    component="endpoint_chains",
+                    message=(
+                        f"new scenario adds endpoint '{endpoint_id}' that is "
+                        f"not present at the snapshot"
+                    ),
+                    endpoint_id=endpoint_id,
+                    expected=None,
+                    found=list(
+                        child_endpoints[endpoint_id].current_chain
+                    ),
+                )
+            )
+            continue
+        want = snapshot_chains[endpoint_id]
+        got = list(child_endpoints[endpoint_id].current_chain)
+        if got != want:
+            mismatches.append(
+                HandoverMismatchItem(
+                    component="endpoint_chains",
+                    message=(
+                        f"endpoint '{endpoint_id}' current_chain must be the "
+                        f"snapshot chain"
+                    ),
+                    endpoint_id=endpoint_id,
+                    expected=want,
+                    found=got,
+                )
+            )
+
+    # The required communication relationships must be exactly the snapshot's.
+    snapshot_rels = sorted(
+        (r.client_id, r.endpoint_id) for r in snapshot.relationships
+    )
+    child_rels = sorted(
+        (r.client_id, r.endpoint_id) for r in child_req.relationships
+    )
+    if child_rels != snapshot_rels:
+        only_snapshot = sorted(set(snapshot_rels) - set(child_rels))
+        only_child = sorted(set(child_rels) - set(snapshot_rels))
+        for client_id, endpoint_id in only_snapshot:
+            mismatches.append(
+                HandoverMismatchItem(
+                    component="relationships",
+                    message=(
+                        f"new scenario drops the required relationship "
+                        f"{client_id} -> {endpoint_id} from the snapshot"
+                    ),
+                    client_id=client_id,
+                    endpoint_id=endpoint_id,
+                    expected={"required": True},
+                    found={"required": False},
+                )
+            )
+        for client_id, endpoint_id in only_child:
+            mismatches.append(
+                HandoverMismatchItem(
+                    component="relationships",
+                    message=(
+                        f"new scenario adds a required relationship "
+                        f"{client_id} -> {endpoint_id} that is not in the "
+                        f"snapshot"
+                    ),
+                    client_id=client_id,
+                    endpoint_id=endpoint_id,
+                    expected={"required": False},
+                    found={"required": True},
+                )
+            )
+
+    mismatches.extend(_cert_attribute_mismatches(parent_req, child_req))
+
+    # Stable ordering: component (anchors, chains, relationships, certs),
+    # then the involved identities.
+    component_order = {
+        "trust_anchors": 0,
+        "endpoint_chains": 1,
+        "relationships": 2,
+        "certificate": 3,
+    }
+    mismatches.sort(
+        key=lambda m: (
+            component_order[m.component],
+            m.client_id or "",
+            m.endpoint_id or "",
+            m.anchor_cert_id or "",
+            m.cert_id or "",
+        )
+    )
+    return mismatches
+
+
+def handover_execution(
+    execution_id: str, req: HandoverRequest
+) -> ExecutionStatus:
+    """Atomically hand an unfinished execution over to a new continuation.
+
+    Outside the transaction the new scenario/plan are parsed, structurally
+    validated and fully replayed from the claimed starting state; inside one
+    ``BEGIN IMMEDIATE`` transaction the optimistic version is re-checked, the
+    original execution is marked ``handed_over`` and the version-0 successor is
+    inserted. Both changes commit together or not at all.
+    """
+
+    # ---- load the original execution (outside the write txn) ---------------
+    read_conn = _connect()
+    try:
+        row = _load_execution(read_conn, execution_id)
+        parent_req = PlanRequest.model_validate(json.loads(row["scenario_json"]))
+        snapshot_blob = read_conn.execute(
+            "SELECT snapshot_json FROM stage_commits WHERE execution_id = ? "
+            "AND version = ?",
+            (execution_id, row["current_version"]),
+        ).fetchone()[0]
+        current_version = row["current_version"]
+        stage_count = row["stage_count"]
+        lifecycle = row["lifecycle"]
+        successor = row["successor_id"]
+    finally:
+        read_conn.close()
+
+    # ---- state guards before any payload content work ----------------------
+    # These mirror the authoritative in-transaction checks below. Evaluating
+    # them first means an impossible handover (the original execution moved on,
+    # was already handed over, or already finished) always fails on that ground
+    # regardless of what the new scenario contains — and creates no child.
+    if req.expected_version != current_version:
+        raise HandoverRejected(
+            HandoverConflict(
+                reason="version_conflict",
+                message=(
+                    f"expected_version {req.expected_version} does not match "
+                    f"execution '{execution_id}' current version "
+                    f"{current_version}; it committed another stage first. "
+                    f"Base the handover on version {current_version} and its "
+                    f"latest snapshot."
+                ),
+                execution_id=execution_id,
+                expected_version=current_version,
+                current_version=current_version,
+            )
+        )
+    if lifecycle == "handed_over":
+        raise HandoverRejected(
+            HandoverConflict(
+                reason="already_handed_over",
+                message=(
+                    f"execution '{execution_id}' was already handed over to "
+                    f"successor '{successor}' at version {current_version}; "
+                    f"a later handover creates no successor."
+                ),
+                execution_id=execution_id,
+                expected_version=current_version,
+                current_version=current_version,
+                successor_execution_id=successor,
+            )
+        )
+    if current_version >= stage_count:
+        raise HandoverRejected(
+            HandoverConflict(
+                reason="execution_finished",
+                message=(
+                    f"execution '{execution_id}' already finished its plan at "
+                    f"version {current_version}; nothing remains to hand over."
+                ),
+                execution_id=execution_id,
+                expected_version=current_version,
+                current_version=current_version,
+            )
+        )
+
+    latest_snapshot = StageSnapshot.model_validate_json(snapshot_blob)
+
+    # ---- parse + fully validate the new scenario ---------------------------
+    child_sc = build_scenario(req)
+    child_batches = _structural_batches(child_sc, req.plan)
+
+    # The continuation must start exactly at the progress already on the books.
+    mismatches = _starting_point_mismatches(parent_req, req, latest_snapshot)
+    if mismatches:
+        raise HandoverConsistencyError(
+            HandoverConsistencyDetail(
+                message=(
+                    f"handover starting point does not match execution "
+                    f"'{execution_id}' version {req.expected_version} latest "
+                    f"snapshot: {len(mismatches)} divergence(s)"
+                ),
+                execution_id=execution_id,
+                expected_version=req.expected_version,
+                current_version=req.expected_version,
+                mismatches=mismatches,
+            )
+        )
+
+    # Replay the continuation plan from the snapshot state itself. The new
+    # scenario's declared initial state was just proven equal to it, so a plan
+    # that breaks a relationship is rejected here before anything is stored.
+    start_state = _state_from_snapshot(latest_snapshot)
+    broken = first_broken_relationship(child_sc, start_state)
+    if broken is not None:
+        from .engine import ReplayFailure
+
+        ridx, pf = broken
+        rf = ReplayFailure(
+            stage=0,
+            relationship_index=ridx,
+            blocking_action_index=None,
+            reason=pf.reason,
+            chain=pf.chain,
+            failure_index=pf.failure_index,
+            trusted_anchors=pf.trusted_anchors,
+        )
+        raise ExecutionReplayError(
+            _replay_failure_dto(child_sc, rf, status="invalid")
+        )
+    for num, batch in enumerate(child_batches, start=1):
+        bits = 0
+        for i in batch:
+            bits |= 1 << i
+        rf = check_batch(child_sc, start_state, bits, num)
+        if rf is not None:
+            raise ExecutionReplayError(
+                _replay_failure_dto(child_sc, rf, status="invalid")
+            )
+        start_state = state_for_mask_applied(child_sc, start_state, bits)
+
+    successor_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc)
+    stages_dto = [
+        PlannedStage(
+            stage=num, action_ids=[child_sc.action_ids[i] for i in batch]
+        )
+        for num, batch in enumerate(child_batches, start=1)
+    ]
+    plan_blob = json.dumps(
+        [s.model_dump() for s in stages_dto], separators=(",", ":")
+    )
+    scenario_blob = json.dumps(
+        req.model_dump(mode="json", exclude={"plan", "expected_version"}),
+        separators=(",", ":"),
+    )
+
+    # The successor's version-0 snapshot continues the original snapshot:
+    # same anchors, chains and relationship status, rebuilt with the new
+    # scenario's certificate metadata.
+    initial_snapshot = _build_snapshot(
+        child_sc,
+        _state_from_snapshot(latest_snapshot),
+        version=0,
+        stage=0,
+        action_ids=[],
+        anchor_observations=[],
+        chain_observations=[],
+        committed_at=now,
+    )
+
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _load_execution(conn, execution_id)
+        current_version = row["current_version"]
+        stage_count = row["stage_count"]
+
+        # Optimistic lock first: the original execution committing its next
+        # stage first advances the version and loses this handover.
+        if req.expected_version != current_version:
+            raise HandoverRejected(
+                HandoverConflict(
+                    reason="version_conflict",
+                    message=(
+                        f"expected_version {req.expected_version} does not "
+                        f"match execution '{execution_id}' current version "
+                        f"{current_version}; it committed another stage first. "
+                        f"Base the handover on version {current_version} and "
+                        f"its latest snapshot."
+                    ),
+                    execution_id=execution_id,
+                    expected_version=current_version,
+                    current_version=current_version,
+                )
+            )
+
+        # Only one successor may ever take over: a handover that lands second
+        # fails here and inserts no child row.
+        if row["lifecycle"] == "handed_over":
+            raise HandoverRejected(
+                HandoverConflict(
+                    reason="already_handed_over",
+                    message=(
+                        f"execution '{execution_id}' was already handed over "
+                        f"to successor '{row['successor_id']}' at version "
+                        f"{current_version}; a later handover creates no "
+                        f"successor."
+                    ),
+                    execution_id=execution_id,
+                    expected_version=current_version,
+                    current_version=current_version,
+                    successor_execution_id=row["successor_id"],
+                )
+            )
+
+        # A finished rotation has no unfinished stage to continue from.
+        if current_version >= stage_count:
+            raise HandoverRejected(
+                HandoverConflict(
+                    reason="execution_finished",
+                    message=(
+                        f"execution '{execution_id}' already finished its "
+                        f"plan at version {current_version}; nothing remains "
+                        f"to hand over."
+                    ),
+                    execution_id=execution_id,
+                    expected_version=current_version,
+                    current_version=current_version,
+                )
+            )
+
+        # Re-derive the snapshot under the lock so the claim is checked
+        # against the exact snapshot the version points to (defense in depth:
+        # the optimistic guard above already pins current_version).
+        locked_blob = conn.execute(
+            "SELECT snapshot_json FROM stage_commits WHERE execution_id = ? "
+            "AND version = ?",
+            (execution_id, current_version),
+        ).fetchone()[0]
+        locked_snapshot = StageSnapshot.model_validate_json(locked_blob)
+        locked_mismatches = _starting_point_mismatches(
+            parent_req, req, locked_snapshot
+        )
+        if locked_mismatches:
+            raise HandoverConsistencyError(
+                HandoverConsistencyDetail(
+                    message=(
+                        f"handover starting point does not match execution "
+                        f"'{execution_id}' version {current_version} latest "
+                        f"snapshot under the write lock"
+                    ),
+                    execution_id=execution_id,
+                    expected_version=req.expected_version,
+                    current_version=current_version,
+                    mismatches=locked_mismatches,
+                )
+            )
+
+        # ---- the two effects of a handover land in this one transaction ----
+        conn.execute(
+            "INSERT INTO plan_executions "
+            "(execution_id, scenario_json, plan_json, stage_count, "
+            "current_version, lifecycle, successor_id, predecessor_id, "
+            "predecessor_version, created_at) "
+            "VALUES (?, ?, ?, ?, 0, 'active', NULL, ?, ?, ?)",
+            (
+                successor_id,
+                scenario_blob,
+                plan_blob,
+                len(child_batches),
+                execution_id,
+                current_version,
+                now.isoformat(),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO stage_commits "
+            "(execution_id, version, stage, payload_json, snapshot_json, "
+            "committed_at) VALUES (?, 0, 0, ?, ?, ?)",
+            (
+                successor_id,
+                json.dumps(
+                    {
+                        "kind": "handover_initial",
+                        "predecessor_execution_id": execution_id,
+                        "predecessor_version": current_version,
+                    },
+                    separators=(",", ":"),
+                ),
+                initial_snapshot.model_dump_json(),
+                now.isoformat(),
+            ),
+        )
+        cur = conn.execute(
+            "UPDATE plan_executions SET lifecycle = 'handed_over', "
+            "successor_id = ? WHERE execution_id = ? AND current_version = ? "
+            "AND lifecycle = 'active'",
+            (successor_id, execution_id, current_version),
+        )
+        # Final guard: the version/lifecycle state the checks ran against must
+        # still hold; otherwise the whole handover rolls back atomically.
+        if cur.rowcount != 1:
+            raise HandoverRejected(
+                HandoverConflict(
+                    reason="already_handed_over",
+                    message=(
+                        f"execution '{execution_id}' changed while the "
+                        f"handover was being committed; no successor was "
+                        f"created."
+                    ),
+                    execution_id=execution_id,
+                )
+            )
+        conn.execute("COMMIT")
+    except HandoverRejected:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    except HandoverConsistencyError:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    return get_execution(successor_id)

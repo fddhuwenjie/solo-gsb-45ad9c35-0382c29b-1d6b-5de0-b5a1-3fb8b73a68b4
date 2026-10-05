@@ -113,13 +113,18 @@ def _result(
     mismatch: Optional[VerificationMismatch],
 ) -> ExecutionVerificationResult:
     finished = verified_version >= pkg.stage_count
+    handed_over = pkg.lifecycle == "handed_over"
     return ExecutionVerificationResult(
         status="ok" if mismatch is None else "conflict",
         execution_id=pkg.execution_id,
+        lifecycle=pkg.lifecycle,
+        successor_execution_id=pkg.successor_execution_id,
+        predecessor_execution_id=pkg.predecessor_execution_id,
+        predecessor_version=pkg.predecessor_version,
         verified_version=verified_version,
         version=pkg.version,
         stage_count=pkg.stage_count,
-        next_stage=None if finished else verified_version + 1,
+        next_stage=None if (finished or handed_over) else verified_version + 1,
         finished=finished,
         mismatch=mismatch,
     )
@@ -514,7 +519,11 @@ def verify_export(pkg: ExecutionExport) -> ExecutionVerificationResult:
     # ---- header bookkeeping must agree with the verified prefix -----------
     expected_completed = list(range(1, pkg.version + 1))
     finished = pkg.version >= pkg.stage_count
-    expected_next = None if finished else pkg.version + 1
+    # A handed-over execution cannot commit further stages even when its own
+    # plan was unfinished: its export carries next_stage null, and the verifier
+    # accepts that null precisely when lifecycle says handed_over.
+    handed_over = pkg.lifecycle == "handed_over"
+    expected_next = None if (finished or handed_over) else pkg.version + 1
     for field_name, want, got in (
         ("completed_stages", expected_completed, list(pkg.completed_stages)),
         ("next_stage", expected_next, pkg.next_stage),

@@ -24,6 +24,9 @@ from .models import (
     ExecutionStatus,
     ExecutionVerificationResult,
     Failure,
+    HandoverConsistencyDetail,
+    HandoverConflict,
+    HandoverRequest,
     NormalizeErrorDetail,
     NormalizeRequest,
     NormalizeResult,
@@ -65,10 +68,13 @@ from .variants import VariantSelectionError, select_variants
 from .execution import (
     CommitRejected,
     ExecutionReplayError,
+    HandoverConsistencyError,
+    HandoverRejected,
     UnknownExecution,
     commit_stage as commit_stage_service,
     export_execution,
     get_execution,
+    handover_execution,
     register_execution,
 )
 from .verification import verify_export
@@ -88,6 +94,10 @@ class _PolicyReviewErrorResponse(BaseModel):
 
 class _VariantSelectionErrorResponse(BaseModel):
     detail: VariantSelectionErrorDetail
+
+
+class _HandoverConsistencyErrorResponse(BaseModel):
+    detail: HandoverConsistencyDetail
 
 app = FastAPI(
     title="TLS Certificate Zero-Downtime Rotation Planner",
@@ -156,6 +166,16 @@ async def _execution_replay_handler(_request, exc: ExecutionReplayError):
 @app.exception_handler(CommitRejected)
 async def _commit_rejected_handler(_request, exc: CommitRejected):
     return JSONResponse(status_code=409, content=exc.conflict.model_dump())
+
+
+@app.exception_handler(HandoverRejected)
+async def _handover_rejected_handler(_request, exc: HandoverRejected):
+    return JSONResponse(status_code=409, content=exc.conflict.model_dump())
+
+
+@app.exception_handler(HandoverConsistencyError)
+async def _handover_consistency_handler(_request, exc: HandoverConsistencyError):
+    return JSONResponse(status_code=422, content={"detail": exc.detail.model_dump()})
 
 
 @app.exception_handler(UnknownExecution)
@@ -696,6 +716,47 @@ def commit_plan_stage(execution_id: str, req: StageCommitRequest) -> Any:
     first, and different content for a completed stage yields 409.
     """
     return commit_stage_service(execution_id, req)
+
+
+@app.post(
+    "/plan-executions/{execution_id}/handover",
+    response_model=ExecutionStatus,
+    status_code=201,
+    responses={
+        404: {"description": "Unknown execution_id"},
+        409: {"model": HandoverConflict},
+        422: {"model": _HandoverConsistencyErrorResponse},
+    },
+    summary="Hand an unfinished execution over to a new continuation plan",
+)
+def handover_plan_execution(execution_id: str, req: HandoverRequest) -> Any:
+    """接棒：轮换执行尚未结束却要改用新计划时，让已落账的进度成为新执行的起点。
+
+    请求携带原 ``execution_id``（路径）、``expected_version``（必须等于原执行
+    当前版本）、新场景字段以及至少一段后续 ``plan``。服务先在事务外完整校验：
+
+    * 新场景的**初始信任锚**必须与原执行最新快照的完整锚集合一致；
+    * 新场景每个端点的 **current_chain** 必须等于快照中该端点当前链；
+    * **必保通信关系**集合必须与快照逐对一致；
+    * 沿用（cert_id 相同）的证书不得改写任何属性（subject / issuer /
+      not_valid_before / not_valid_after），新增证书只能用于新目标链与后续动作；
+    * 后续计划从阶段 1 起、**以该快照为起点**完整回放，每阶段后每条通信关系
+      仍须有有效信任路径（破坏时与登记接口同样返回 409 Failure，且不创建子执行）。
+
+    全部通过后，在**单个 SQLite 事务**内同时完成两件事：把旧执行标记为
+    ``handed_over``（记录 successor），并登记一个从该快照开始、自身版本为 0
+    的新执行（记录 predecessor）；两者要么同时落账，要么都不改变。原执行若在
+    接棒前刚提交了下一阶段（``expected_version`` 落后）返回
+    ``409 version_conflict``；已有接棒先完成时后来的接棒以
+    ``409 already_handed_over`` 失败且**不留任何子记录**；原计划已全部完成则
+    ``409 execution_finished``。起点与快照不一致返回 422，逐项列出分歧。
+
+    接棒后旧执行不能再提交未完成阶段
+    （``409 execution_handed_over``），已提交阶段以同内容、当前版本重试仍按原
+    幂等规则返回同一份快照。新旧执行的查询与导出都带 predecessor / successor
+    可追踪来源与去向，旧执行及其导出仍可读取、异地核验。
+    """
+    return handover_execution(execution_id, req)
 
 
 @app.get(

@@ -1789,9 +1789,136 @@ class ExecutionRegisterRequest(PlanRequest):
 
     plan: list[ExecutionStage] = Field(
         ...,
-        description="Stages numbered consecutively from 1; every scenario "
-                    "action scheduled exactly once; no-op empty stages "
-                    "allowed, exactly as in /plans/verify.",
+        description="Stages 1..; every scenario action scheduled exactly once; "
+                    "no-op empty stages allowed, exactly as in /plans/verify.",
+    )
+
+
+class HandoverRequest(PlanRequest):
+    """接棒请求：以原执行最新快照为起点的新场景与后续计划。
+
+    新场景的初始信任锚、各端点当前链与必保通信关系必须与原执行最新快照
+    逐一致；沿用（cert_id 相同）的证书不得改写任何属性，新增证书只能出现在
+    目标链与尚未执行的动作中。``expected_version`` 是乐观锁：必须等于原执行
+    落账时的当前版本。
+    """
+
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description="The original execution's current version this handover is "
+                    "based on: the version whose latest snapshot becomes the new "
+                    "execution's starting point. A mismatch (the original "
+                    "execution committed another stage first) is rejected with "
+                    "409 version_conflict and creates no successor.",
+    )
+    plan: list[ExecutionStage] = Field(
+        ...,
+        min_length=1,
+        description="Continuation plan, stages numbered from 1; every action of "
+                    "the new scenario scheduled exactly once. At least one "
+                    "follow-up stage is required; its stage-1 replay starts "
+                    "from the handed-over snapshot.",
+    )
+
+    @model_validator(mode="after")
+    def _requires_follow_up(self) -> "HandoverRequest":
+        if not self.actions:
+            raise ValueError(
+                "handover requires a follow-up plan: the new scenario must "
+                "define at least one action"
+            )
+        return self
+
+
+class HandoverMismatchItem(BaseModel):
+    """One way the new scenario's starting point diverges from the snapshot."""
+
+    component: Literal[
+        "certificate", "trust_anchors", "endpoint_chains", "relationships"
+    ] = Field(
+        ...,
+        description="Where the divergence is: a reused certificate's "
+                    "attributes, the initial trust-anchor set, an endpoint's "
+                    "current chain, or the required relationships.",
+    )
+    message: str
+    client_id: Optional[str] = Field(
+        default=None,
+        description="For trust_anchors/relationships items: the client involved.",
+    )
+    endpoint_id: Optional[str] = Field(
+        default=None,
+        description="For endpoint_chains/relationships items: the endpoint involved.",
+    )
+    anchor_cert_id: Optional[str] = Field(
+        default=None, description="For trust_anchors items: the anchor cert."
+    )
+    cert_id: Optional[str] = Field(
+        default=None, description="For certificate items: the reused cert_id."
+    )
+    attribute: Optional[str] = Field(
+        default=None,
+        description="For certificate items: the diverging attribute(s), "
+                    "comma-joined (subject / issuer / not_valid_before / "
+                    "not_valid_after).",
+    )
+    expected: Optional[Any] = Field(
+        default=None, description="The value implied by the original snapshot."
+    )
+    found: Optional[Any] = Field(
+        default=None, description="The value submitted in the new scenario."
+    )
+
+
+class HandoverConsistencyDetail(BaseModel):
+    """422 body: the handover starting point is not the claimed snapshot."""
+
+    error: Literal["handover_snapshot_mismatch"] = "handover_snapshot_mismatch"
+    message: str
+    execution_id: str = Field(
+        ..., description="The original execution_id the handover targeted."
+    )
+    expected_version: int = Field(
+        ..., description="The version the handover was based on."
+    )
+    current_version: int = Field(
+        ..., description="The original execution's current stored version."
+    )
+    mismatches: list[HandoverMismatchItem] = Field(
+        ...,
+        description="Every detected divergence, stably ordered by component "
+                    "then identity.",
+    )
+
+
+class HandoverConflict(BaseModel):
+    """409 body for a handover rejected by the transactional guards."""
+
+    status: Literal["conflict"] = "conflict"
+    reason: Literal[
+        "version_conflict",
+        "already_handed_over",
+        "execution_finished",
+    ] = Field(
+        ...,
+        description="version_conflict: expected_version differs from the "
+                    "original execution's current version (it committed "
+                    "another stage first); already_handed_over: a successor "
+                    "was already registered (the later handover creates no "
+                    "child); execution_finished: the original execution had "
+                    "already reached the end of its plan.",
+    )
+    message: str
+    execution_id: str = Field(..., description="The original execution_id.")
+    expected_version: Optional[int] = Field(
+        default=None,
+        description="The version a retry must base itself on, when applicable.",
+    )
+    current_version: Optional[int] = None
+    successor_execution_id: Optional[str] = Field(
+        default=None,
+        description="For already_handed_over: the successor that won the race.",
     )
 
 
@@ -1958,6 +2085,13 @@ class ExecutionStatus(BaseModel):
 
     status: Literal["ok"] = "ok"
     execution_id: str
+    lifecycle: Literal["active", "handed_over"] = Field(
+        ...,
+        description="active: stages may still be committed; handed_over: a "
+                    "successor execution has taken over from this execution's "
+                    "latest snapshot, so no unfinished stage can be committed "
+                    "any more (the record and its snapshots stay readable).",
+    )
     version: int = Field(
         ...,
         description="Current monotonically increasing version: number of "
@@ -1970,9 +2104,28 @@ class ExecutionStatus(BaseModel):
     next_stage: Optional[int] = Field(
         ...,
         description="Next stage that must be committed; null once the whole "
-                    "plan (including trailing no-op stages) is finished.",
+                    "plan (including trailing no-op stages) is finished, or "
+                    "once the execution has been handed over.",
     )
     finished: bool
+    successor_execution_id: Optional[str] = Field(
+        default=None,
+        description="When lifecycle is handed_over: the child execution that "
+                    "continues from this execution's latest snapshot; null "
+                    "otherwise (source -> destination traceability).",
+    )
+    predecessor_execution_id: Optional[str] = Field(
+        default=None,
+        description="For a child created by a handover: the original execution "
+                    "whose latest snapshot is this execution's starting point; "
+                    "null for an ordinary registration (destination -> source).",
+    )
+    predecessor_version: Optional[int] = Field(
+        default=None,
+        description="For a child created by a handover: the original "
+                    "execution's version whose snapshot it starts from (its own "
+                    "initial snapshot is version 0); null otherwise.",
+    )
     snapshots: list[StageSnapshot] = Field(
         ..., description="Every saved snapshot, version 0 first, oldest to newest."
     )
@@ -1990,9 +2143,11 @@ class CommitConflict(BaseModel):
                     "re-submitted with different content), "
                     "action_set_mismatch (the committed action set is not "
                     "exactly the plan stage), observation_mismatch (a field "
-                    "observation contradicts the computed state), or a trust "
-                    "replay code (untrusted_root / issuer_mismatch / "
-                    "action_not_allowed_at_stage / "
+                    "observation contradicts the computed state), "
+                    "execution_handed_over (the execution has already been "
+                    "handed to a successor and cannot commit an unfinished "
+                    "stage), or a trust replay code (untrusted_root / "
+                    "issuer_mismatch / action_not_allowed_at_stage / "
                     "contradictory_actions_same_stage).",
     )
     message: str
@@ -2071,6 +2226,11 @@ class ExecutionExport(BaseModel):
     )
     format_version: Literal[1] = 1
     execution_id: str
+    lifecycle: Literal["active", "handed_over"] = Field(
+        default="active",
+        description="active, or handed_over once a successor execution took "
+                    "over from this package's latest snapshot.",
+    )
     version: int = Field(..., ge=0, description="The one version this package captures.")
     stage_count: int = Field(..., ge=0)
     completed_stages: list[int] = Field(
@@ -2079,9 +2239,24 @@ class ExecutionExport(BaseModel):
     next_stage: Optional[int] = Field(
         ...,
         description="Next stage to commit at the captured version; null when "
-                    "the whole plan was finished.",
+                    "the whole plan was finished or the execution was handed over.",
     )
     finished: bool
+    successor_execution_id: Optional[str] = Field(
+        default=None,
+        description="When handed over, the successor execution id; null otherwise.",
+    )
+    predecessor_execution_id: Optional[str] = Field(
+        default=None,
+        description="For a successor execution: the original execution whose "
+                    "snapshot is this package's version-0 starting point; "
+                    "null for an ordinary registration.",
+    )
+    predecessor_version: Optional[int] = Field(
+        default=None,
+        description="For a successor execution: the original execution version "
+                    "its starting snapshot was captured at; null otherwise.",
+    )
     created_at: datetime
     scenario: PlanRequest = Field(
         ..., description="The scenario stored verbatim at registration."
@@ -2168,6 +2343,25 @@ class ExecutionVerificationResult(BaseModel):
 
     status: Literal["ok", "conflict"]
     execution_id: str
+    lifecycle: Literal["active", "handed_over"] = Field(
+        default="active",
+        description="Mirrors the exported package's lifecycle, so an off-site "
+                    "verifier can see the execution was handed over.",
+    )
+    successor_execution_id: Optional[str] = Field(
+        default=None,
+        description="Mirrors the export: where this execution went on handover.",
+    )
+    predecessor_execution_id: Optional[str] = Field(
+        default=None,
+        description="Mirrors the export: where this execution came from (the "
+                    "original execution whose snapshot is its version 0).",
+    )
+    predecessor_version: Optional[int] = Field(
+        default=None,
+        description="Mirrors the export: the predecessor snapshot version this "
+                    "execution's version 0 continues from.",
+    )
     verified_version: int = Field(
         ...,
         description="The last fully verified version: only versions whose "
