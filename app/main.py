@@ -20,10 +20,13 @@ from .models import (
     ChainCert,
     CommitConflict,
     ExecutionExport,
+    ExecutionHandoffRequest,
+    ExecutionHandoffSuccess,
     ExecutionRegisterRequest,
     ExecutionStatus,
     ExecutionVerificationResult,
     Failure,
+    HandoffValidationErrorDetail,
     NormalizeErrorDetail,
     NormalizeRequest,
     NormalizeResult,
@@ -65,10 +68,12 @@ from .variants import VariantSelectionError, select_variants
 from .execution import (
     CommitRejected,
     ExecutionReplayError,
+    HandoffValidationError,
     UnknownExecution,
     commit_stage as commit_stage_service,
     export_execution,
     get_execution,
+    handoff_execution,
     register_execution,
 )
 from .verification import verify_export
@@ -88,6 +93,10 @@ class _PolicyReviewErrorResponse(BaseModel):
 
 class _VariantSelectionErrorResponse(BaseModel):
     detail: VariantSelectionErrorDetail
+
+
+class _HandoffValidationResponse(BaseModel):
+    detail: HandoffValidationErrorDetail
 
 app = FastAPI(
     title="TLS Certificate Zero-Downtime Rotation Planner",
@@ -156,6 +165,11 @@ async def _execution_replay_handler(_request, exc: ExecutionReplayError):
 @app.exception_handler(CommitRejected)
 async def _commit_rejected_handler(_request, exc: CommitRejected):
     return JSONResponse(status_code=409, content=exc.conflict.model_dump())
+
+
+@app.exception_handler(HandoffValidationError)
+async def _handoff_validation_handler(_request, exc: HandoffValidationError):
+    return JSONResponse(status_code=422, content={"detail": exc.detail.model_dump()})
 
 
 @app.exception_handler(UnknownExecution)
@@ -696,6 +710,44 @@ def commit_plan_stage(execution_id: str, req: StageCommitRequest) -> Any:
     first, and different content for a completed stage yields 409.
     """
     return commit_stage_service(execution_id, req)
+
+
+@app.post(
+    "/plan-executions/{execution_id}/handoffs",
+    response_model=ExecutionHandoffSuccess,
+    status_code=201,
+    responses={
+        404: {"description": "Unknown execution_id"},
+        409: {"model": CommitConflict},
+        422: {"model": _HandoffValidationResponse},
+    },
+    summary="Hand an unfinished execution over to a new continuation plan",
+)
+def handoff_plan_execution(execution_id: str, req: ExecutionHandoffRequest) -> Any:
+    """Make the already committed progress of a still-unfinished execution the
+    starting point of a brand-new execution under a new plan.
+
+    The request carries the original ``execution_id``, the
+    ``expected_version`` optimistic lock, a full new scenario and at least
+    one continuation-plan stage. The new scenario's initial trust anchors,
+    every endpoint's current chain and the required communication
+    relationships must equal the parent's latest committed snapshot, and any
+    certificate id reused from the parent scenario must keep identical
+    certificate attributes; the continuation plan is structurally validated
+    and fully replayed (every stage must keep communication alive) before
+    anything is written.
+
+    Inside one SQLite transaction the parent execution is marked handed off
+    (conditional on ``expected_version`` still matching) and a fresh
+    execution is registered from that snapshot at version 0 — the two either
+    land together or neither changes. A handoff that races with a
+    just-committed next stage (``version_conflict``), or that arrives after a
+    first handoff already completed (``handoff_already_exists``), fails with
+    409 and leaves no child record. Afterwards the parent can no longer
+    commit uncommitted stages, while identical-content retries of stages it
+    already committed stay idempotent.
+    """
+    return handoff_execution(execution_id, req)
 
 
 @app.get(

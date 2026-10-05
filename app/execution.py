@@ -33,7 +33,7 @@ import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .engine import (
     Scenario,
@@ -52,6 +52,8 @@ from .models import (
     CommitAnchorObservation,
     CommitChainObservation,
     CommitConflict,
+    ExecutionHandoffRecord,
+    ExecutionOrigin,
     ExecutionRegisterRequest,
     ExecutionStage,
     ExecutionStatus,
@@ -66,14 +68,26 @@ from .models import (
     SnapshotTrustAnchor,
 )
 
+if TYPE_CHECKING:
+    from .models import (
+        ExecutionHandoffRequest,
+        HandoffValidationErrorDetail,
+    )
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS plan_executions (
-    execution_id    TEXT PRIMARY KEY,
-    scenario_json   TEXT NOT NULL,
-    plan_json       TEXT NOT NULL,
-    stage_count     INTEGER NOT NULL,
-    current_version INTEGER NOT NULL,
-    created_at      TEXT NOT NULL
+    execution_id          TEXT PRIMARY KEY,
+    scenario_json         TEXT NOT NULL,
+    plan_json             TEXT NOT NULL,
+    stage_count           INTEGER NOT NULL,
+    current_version       INTEGER NOT NULL,
+    created_at            TEXT NOT NULL,
+    handed_off            INTEGER NOT NULL DEFAULT 0,
+    child_execution_id    TEXT,
+    handed_off_at         TEXT,
+    origin_parent_id      TEXT,
+    origin_parent_version INTEGER,
+    origin_at             TEXT
 );
 CREATE TABLE IF NOT EXISTS stage_commits (
     execution_id  TEXT NOT NULL,
@@ -87,6 +101,17 @@ CREATE TABLE IF NOT EXISTS stage_commits (
     FOREIGN KEY (execution_id) REFERENCES plan_executions(execution_id)
 );
 """
+
+# Columns added after the first release; applied to stores created before the
+# handoff feature existed. Each entry is (column, DDL fragment).
+_ADDED_COLUMNS = [
+    ("handed_off", "INTEGER NOT NULL DEFAULT 0"),
+    ("child_execution_id", "TEXT"),
+    ("handed_off_at", "TEXT"),
+    ("origin_parent_id", "TEXT"),
+    ("origin_parent_version", "INTEGER"),
+    ("origin_at", "TEXT"),
+]
 
 
 class ExecutionReplayError(Exception):
@@ -103,6 +128,16 @@ class CommitRejected(Exception):
     def __init__(self, conflict: CommitConflict) -> None:
         super().__init__(conflict.message)
         self.conflict = conflict
+
+
+class HandoffValidationError(Exception):
+    """The handoff's new scenario is not anchored at the parent's latest
+    committed snapshot, or reuses a certificate id with different attributes
+    (HTTP 422)."""
+
+    def __init__(self, detail: "HandoffValidationErrorDetail") -> None:
+        super().__init__(detail.message)
+        self.detail = detail
 
 
 class UnknownExecution(Exception):
@@ -141,6 +176,19 @@ def _connect() -> sqlite3.Connection:
             if path not in _initialized:
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.executescript(SCHEMA)
+                # Upgrade older stores in place: add the lineage columns the
+                # handoff feature needs without touching existing rows.
+                existing = {
+                    r["name"]
+                    for r in conn.execute(
+                        "PRAGMA table_info(plan_executions)"
+                    ).fetchall()
+                }
+                for name, ddl in _ADDED_COLUMNS:
+                    if name not in existing:
+                        conn.execute(
+                            f"ALTER TABLE plan_executions ADD COLUMN {name} {ddl}"
+                        )
                 _initialized.add(path)
     return conn
 
@@ -358,6 +406,30 @@ def _build_snapshot(
 # ---------------------------------------------------------------------------
 
 
+def _lineage_from_row(
+    row: sqlite3.Row,
+) -> tuple[Optional[ExecutionOrigin], Optional[ExecutionHandoffRecord]]:
+    origin = None
+    handoff = None
+    origin_at = row["origin_at"] if "origin_at" in row.keys() else None
+    if origin_at is not None:
+        origin = ExecutionOrigin(
+            parent_execution_id=row["origin_parent_id"],
+            parent_version=row["origin_parent_version"],
+            handed_off_at=datetime.fromisoformat(origin_at),
+        )
+    handed_off_at = (
+        row["handed_off_at"] if "handed_off_at" in row.keys() else None
+    )
+    if handed_off_at is not None:
+        handoff = ExecutionHandoffRecord(
+            child_execution_id=row["child_execution_id"],
+            parent_version=row["current_version"],
+            handed_off_at=datetime.fromisoformat(handed_off_at),
+        )
+    return origin, handoff
+
+
 def _status_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ExecutionStatus:
     cur = conn.execute(
         "SELECT snapshot_json FROM stage_commits WHERE execution_id = ? "
@@ -371,6 +443,8 @@ def _status_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ExecutionSta
     stage_count = row["stage_count"]
     completed = [s.stage for s in snapshots if s.stage >= 1]
     finished = version >= stage_count
+    handed_off = bool(row["handed_off"]) if "handed_off" in row.keys() else False
+    origin, handoff = _lineage_from_row(row)
     return ExecutionStatus(
         execution_id=row["execution_id"],
         version=version,
@@ -378,6 +452,9 @@ def _status_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> ExecutionSta
         completed_stages=completed,
         next_stage=None if finished else version + 1,
         finished=finished,
+        handed_off=handed_off,
+        origin=origin,
+        handoff=handoff,
         snapshots=snapshots,
     )
 
@@ -476,6 +553,7 @@ def export_execution(execution_id: str) -> "ExecutionExport":
         )
 
     finished = version >= stage_count
+    origin, handoff = _lineage_from_row(row)
     return ExecutionExport(
         execution_id=row["execution_id"],
         version=version,
@@ -484,6 +562,8 @@ def export_execution(execution_id: str) -> "ExecutionExport":
         next_stage=None if finished else version + 1,
         finished=finished,
         created_at=datetime.fromisoformat(row["created_at"]),
+        origin=origin,
+        handoff=handoff,
         scenario=scenario,
         plan=plan,
         commits=commits,
@@ -495,6 +575,80 @@ def export_execution(execution_id: str) -> "ExecutionExport":
 # ---------------------------------------------------------------------------
 
 
+def _plan_blob(sc: Scenario, batches: list[list[int]]) -> str:
+    stages_dto = [
+        PlannedStage(
+            stage=num, action_ids=[sc.action_ids[i] for i in batch]
+        )
+        for num, batch in enumerate(batches, start=1)
+    ]
+    return json.dumps(
+        [s.model_dump() for s in stages_dto], separators=(",", ":")
+    )
+
+
+def _insert_new_execution(
+    conn: sqlite3.Connection,
+    *,
+    execution_id: str,
+    scenario_blob: str,
+    plan_blob: str,
+    stage_count: int,
+    initial_snapshot: StageSnapshot,
+    now: datetime,
+    origin: Optional[tuple[str, int, datetime]] = None,
+) -> None:
+    """Insert an execution row and its version-0 commit.
+
+    Runs inside the caller's current write transaction: for a normal
+    registration that transaction wraps just this insert; for a handoff the
+    same transaction also marks the parent handed off, so the two either land
+    together or not at all. ``origin`` is ``(parent_execution_id,
+    parent_version, handed_off_at)`` for a handoff-created execution.
+    """
+
+    conn.execute(
+        "INSERT INTO plan_executions "
+        "(execution_id, scenario_json, plan_json, stage_count, "
+        "current_version, created_at, handed_off, child_execution_id, "
+        "handed_off_at, origin_parent_id, origin_parent_version, origin_at) "
+        "VALUES (?, ?, ?, ?, 0, ?, 0, NULL, NULL, ?, ?, ?)",
+        (
+            execution_id,
+            scenario_blob,
+            plan_blob,
+            stage_count,
+            now.isoformat(),
+            origin[0] if origin else None,
+            origin[1] if origin else None,
+            origin[2].isoformat() if origin else None,
+        ),
+    )
+    payload = (
+        json.dumps(
+            {
+                "kind": "handoff-initial",
+                "parent_execution_id": origin[0],
+                "parent_version": origin[1],
+            },
+            separators=(",", ":"),
+        )
+        if origin
+        else json.dumps({"kind": "initial"}, separators=(",", ":"))
+    )
+    conn.execute(
+        "INSERT INTO stage_commits "
+        "(execution_id, version, stage, payload_json, snapshot_json, "
+        "committed_at) VALUES (?, 0, 0, ?, ?, ?)",
+        (
+            execution_id,
+            payload,
+            initial_snapshot.model_dump_json(),
+            now.isoformat(),
+        ),
+    )
+
+
 def register_execution(req: ExecutionRegisterRequest) -> ExecutionStatus:
     sc = build_scenario(req)
     batches = _structural_batches(sc, req.plan)
@@ -504,15 +658,6 @@ def register_execution(req: ExecutionRegisterRequest) -> ExecutionStatus:
 
     execution_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc)
-    stages_dto = [
-        PlannedStage(
-            stage=num, action_ids=[sc.action_ids[i] for i in batch]
-        )
-        for num, batch in enumerate(batches, start=1)
-    ]
-    plan_blob = json.dumps(
-        [s.model_dump() for s in stages_dto], separators=(",", ":")
-    )
 
     initial_snapshot = _build_snapshot(
         sc,
@@ -535,28 +680,14 @@ def register_execution(req: ExecutionRegisterRequest) -> ExecutionStatus:
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            "INSERT INTO plan_executions "
-            "(execution_id, scenario_json, plan_json, stage_count, "
-            "current_version, created_at) VALUES (?, ?, ?, ?, 0, ?)",
-            (
-                execution_id,
-                scenario_blob,
-                plan_blob,
-                len(batches),
-                now.isoformat(),
-            ),
-        )
-        conn.execute(
-            "INSERT INTO stage_commits "
-            "(execution_id, version, stage, payload_json, snapshot_json, "
-            "committed_at) VALUES (?, 0, 0, ?, ?, ?)",
-            (
-                execution_id,
-                json.dumps({"kind": "initial"}, separators=(",", ":")),
-                initial_snapshot.model_dump_json(),
-                now.isoformat(),
-            ),
+        _insert_new_execution(
+            conn,
+            execution_id=execution_id,
+            scenario_blob=scenario_blob,
+            plan_blob=_plan_blob(sc, batches),
+            stage_count=len(batches),
+            initial_snapshot=initial_snapshot,
+            now=now,
         )
         conn.execute("COMMIT")
     except Exception:
@@ -728,6 +859,30 @@ def commit_stage(
                     expected_version=current_version,
                     current_version=current_version,
                     stage=stage,
+                )
+            )
+
+        # -- a handed-off execution can no longer make new progress ---------
+        # The check comes after the idempotent replay above, so retries of an
+        # already committed stage (even one landing after the handoff) still
+        # return the same stored snapshot under the original idempotency rule;
+        # only not-yet-committed stages are refused.
+        if bool(row["handed_off"]):
+            raise CommitRejected(
+                CommitConflict(
+                    reason="execution_already_handed_off",
+                    message=(
+                        f"execution '{execution_id}' has handed off to "
+                        f"successor execution "
+                        f"'{row['child_execution_id']}' at version "
+                        f"{current_version}; no further stage may be "
+                        f"committed against it (stage {stage} is not part of "
+                        f"the recorded prefix)."
+                    ),
+                    expected_version=current_version,
+                    current_version=current_version,
+                    stage=stage,
+                    child_execution_id=row["child_execution_id"],
                 )
             )
 
@@ -941,3 +1096,435 @@ def commit_stage(
         conn.close()
 
     return get_execution(execution_id)
+
+
+# ---------------------------------------------------------------------------
+# Mid-execution handoff to a new plan
+# ---------------------------------------------------------------------------
+
+
+def _certificate_attribute_mismatches(
+    parent_sc: Scenario,
+    req: "ExecutionHandoffRequest",
+) -> list["HandoffMismatch"]:
+    """Check reused certificate ids against the raw new scenario.
+
+    Runs *before* the new scenario is built (a changed subject/issuer on a
+    reused id could otherwise trip chain validation first), so a reused id
+    with changed attributes is always reported as the structured
+    certificate_attribute_mismatch instead of a generic scenario error.
+    """
+
+    from .models import HandoffMismatch
+
+    mismatches: list[HandoffMismatch] = []
+    for new_cert in req.certificates:
+        old = parent_sc.certs.get(new_cert.cert_id)
+        if old is None:
+            continue  # a genuinely new certificate: no inherited attributes
+        comparisons = (
+            ("subject", old.subject, new_cert.subject),
+            ("issuer", old.issuer, new_cert.issuer),
+            ("not_before", old.not_before, _as_utc_dt(new_cert.not_valid_before)),
+            ("not_after", old.not_after, _as_utc_dt(new_cert.not_valid_after)),
+        )
+        for field, old_v, new_v in comparisons:
+            if old_v != new_v:
+                mismatches.append(
+                    HandoffMismatch(
+                        kind="certificate_attribute_mismatch",
+                        message=(
+                            f"certificate '{new_cert.cert_id}' reuses an id "
+                            f"from the parent scenario but its {field} "
+                            f"changed ({_fmt_attr(old_v)} -> "
+                            f"{_fmt_attr(new_v)}); reused certificate ids "
+                            f"must keep identical attributes."
+                        ),
+                        cert_id=new_cert.cert_id,
+                        expected=_fmt_attr(old_v),
+                        found=_fmt_attr(new_v),
+                    )
+                )
+    mismatches.sort(key=lambda m: (m.cert_id or "", m.message))
+    return mismatches
+
+
+def _as_utc_dt(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _fmt_attr(value: Any) -> Any:
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _handoff_state_mismatches(
+    new_sc: Scenario,
+    latest: StageSnapshot,
+) -> list["HandoffMismatch"]:
+    """Snapshot anchoring checks requiring the built new scenario: initial
+    trust anchors, endpoint current chains and required relationships must
+    equal exactly the parent's latest committed snapshot."""
+
+    from .models import HandoffMismatch
+
+    mismatches: list[HandoffMismatch] = []
+
+    # 1. initial trust anchors must be the same (client, anchor) edge set
+    parent_anchors = {
+        (a.client_id, a.anchor_cert_id) for a in latest.trust_anchors
+    }
+    new_anchors = {
+        (edge.client_id, edge.cert_id) for edge in new_sc.initial_anchors
+    }
+    for client_id, anchor_cert_id in sorted(parent_anchors ^ new_anchors):
+        in_parent = (client_id, anchor_cert_id) in parent_anchors
+        detail = (
+            "present in the parent snapshot but absent from the new scenario"
+            if in_parent
+            else "declared by the new scenario but absent from the parent "
+            "snapshot"
+        )
+        mismatches.append(
+            HandoffMismatch(
+                kind="trust_anchor_mismatch",
+                message=(
+                    f"trust anchor ({client_id}, {anchor_cert_id}) is "
+                    f"{detail}; the new scenario must start from exactly the "
+                    f"recorded anchors."
+                ),
+                client_id=client_id,
+                anchor_cert_id=anchor_cert_id,
+                expected={"present": in_parent},
+                found={"present": not in_parent},
+            )
+        )
+
+    # 2. endpoints and their current chains must match the snapshot exactly
+    parent_chains = {
+        e.endpoint_id: tuple(e.chain) for e in latest.endpoint_chains
+    }
+    new_chains = {
+        ep: tuple(ch) for ep, ch in new_sc.endpoint_chains.items()
+    }
+    for ep in sorted(parent_chains.keys() | new_chains.keys()):
+        if ep not in new_chains:
+            mismatches.append(
+                HandoffMismatch(
+                    kind="endpoint_chain_mismatch",
+                    message=(
+                        f"endpoint '{ep}' is present in the parent snapshot "
+                        f"but missing from the new scenario; the handoff must "
+                        f"cover every recorded endpoint."
+                    ),
+                    endpoint_id=ep,
+                    expected=list(parent_chains[ep]),
+                    found=None,
+                )
+            )
+        elif ep not in parent_chains:
+            mismatches.append(
+                HandoffMismatch(
+                    kind="endpoint_chain_mismatch",
+                    message=(
+                        f"endpoint '{ep}' is declared by the new scenario but "
+                        f"absent from the parent snapshot; a handoff cannot "
+                        f"introduce new endpoints mid-rotation."
+                    ),
+                    endpoint_id=ep,
+                    expected=None,
+                    found=list(new_chains[ep]),
+                )
+            )
+        elif new_chains[ep] != parent_chains[ep]:
+            mismatches.append(
+                HandoffMismatch(
+                    kind="endpoint_chain_mismatch",
+                    message=(
+                        f"endpoint '{ep}' current_chain does not match the "
+                        f"parent snapshot's served chain; the new plan starts "
+                        f"from the recorded field state, not the old scenario."
+                    ),
+                    endpoint_id=ep,
+                    expected=list(parent_chains[ep]),
+                    found=list(new_chains[ep]),
+                )
+            )
+
+    # 3. required communication relationships must be the same set
+    parent_rels = {
+        (r.client_id, r.endpoint_id) for r in latest.relationships
+    }
+    new_rels = {(r.client_id, r.endpoint_id) for r in new_sc.relationships}
+    for client_id, endpoint_id in sorted(parent_rels ^ new_rels):
+        in_parent = (client_id, endpoint_id) in parent_rels
+        detail = (
+            "required by the parent snapshot but absent from the new scenario"
+            if in_parent
+            else "declared by the new scenario but absent from the parent "
+            "snapshot"
+        )
+        mismatches.append(
+            HandoffMismatch(
+                kind="relationship_mismatch",
+                message=(
+                    f"relationship ({client_id} -> {endpoint_id}) is "
+                    f"{detail}; the set of communication relationships is "
+                    f"immutable across a handoff."
+                ),
+                client_id=client_id,
+                endpoint_id=endpoint_id,
+                expected={"required": in_parent},
+                found={"required": not in_parent},
+            )
+        )
+
+    # Stable order: by kind, then the identifying fields.
+    kind_order = {
+        "trust_anchor_mismatch": 0,
+        "endpoint_chain_mismatch": 1,
+        "relationship_mismatch": 2,
+        "certificate_attribute_mismatch": 3,
+    }
+    mismatches.sort(
+        key=lambda m: (
+            kind_order[m.kind],
+            m.client_id or "",
+            m.endpoint_id or "",
+            m.anchor_cert_id or "",
+            m.cert_id or "",
+            m.message,
+        )
+    )
+    return mismatches
+
+
+def handoff_execution(
+    execution_id: str, req: "ExecutionHandoffRequest"
+) -> "ExecutionHandoffSuccess":
+    """Atomically hand an unfinished execution over to a new continuation plan.
+
+    The new scenario must start from exactly the parent's latest committed
+    snapshot (trust anchors, endpoint current chains and required
+    relationships), and reused certificate ids must keep their attributes.
+    The continuation plan is structurally validated and fully replayed
+    before anything is written. Inside one ``BEGIN IMMEDIATE`` transaction
+    the parent row is marked handed off (conditional on the
+    ``expected_version`` optimistic lock) and a fresh execution starting at
+    version 0 from that snapshot is inserted: either both land or neither
+    does. A handoff that loses a race with a stage commit or with an earlier
+    handoff fails with 409 and leaves no child record.
+    """
+
+    from .models import (
+        ExecutionHandoffSuccess,
+        HandoffValidationErrorDetail,
+    )
+
+    # ---- load the parent + its latest snapshot (outside the write txn) -----
+    read_conn = _connect()
+    try:
+        parent_row = _load_execution(read_conn, execution_id)
+        parent_scenario_blob = parent_row["scenario_json"]
+        current_version = parent_row["current_version"]
+
+        # Optimistic-lock check against the latest read, before doing the
+        # expensive validation; it is re-checked authoritatively under the
+        # write lock below.
+        if req.expected_version != current_version:
+            raise CommitRejected(
+                _conflict(
+                    "version_conflict",
+                    f"expected_version {req.expected_version} does not match "
+                    f"the current version {current_version} of execution "
+                    f"'{execution_id}'; refresh its status and rebase the "
+                    f"handoff on the latest snapshot.",
+                    expected_version=current_version,
+                    current_version=current_version,
+                )
+            )
+
+        latest_blob = read_conn.execute(
+            "SELECT snapshot_json FROM stage_commits "
+            "WHERE execution_id = ? ORDER BY version DESC LIMIT 1",
+            (execution_id,),
+        ).fetchone()[0]
+    finally:
+        read_conn.close()
+
+    latest_snapshot = StageSnapshot.model_validate_json(latest_blob)
+
+    # ---- parse the parent scenario ----------------------------------------
+    parent_req = PlanRequest.model_validate(json.loads(parent_scenario_blob))
+    parent_sc = build_scenario(parent_req)
+
+    # ---- reused certificate ids must keep identical attributes ------------
+    # Checked against the raw request before the new scenario is built, so a
+    # renamed reused cert is reported here rather than as an opaque chain
+    # validation error (and the response lists every divergence at once).
+    cert_mismatches = _certificate_attribute_mismatches(parent_sc, req)
+    if cert_mismatches:
+        raise HandoffValidationError(
+            HandoffValidationErrorDetail(
+                message=(
+                    f"the new scenario reuses certificate id(s) from "
+                    f"execution '{execution_id}' with changed attributes; a "
+                    f"reused cert_id must keep subject, issuer and validity "
+                    f"identical."
+                ),
+                parent_execution_id=execution_id,
+                parent_version=current_version,
+                mismatches=cert_mismatches,
+            )
+        )
+
+    # ---- build + validate the new scenario and continuation plan ----------
+    new_sc = build_scenario(req)
+    batches = _structural_batches(new_sc, req.plan)
+    replay_plan(new_sc, batches)
+
+    # ---- the new scenario's initial state must be the recorded progress ----
+    mismatches = _handoff_state_mismatches(new_sc, latest_snapshot)
+    if mismatches:
+        raise HandoffValidationError(
+            HandoffValidationErrorDetail(
+                message=(
+                    f"the new scenario is not anchored at execution "
+                    f"'{execution_id}' version {current_version}: "
+                    f"{len(mismatches)} mismatch(es) with the latest "
+                    f"committed snapshot; the recorded progress must be the "
+                    f"exact starting point of the handoff."
+                ),
+                parent_execution_id=execution_id,
+                parent_version=current_version,
+                mismatches=mismatches,
+            )
+        )
+
+    # ---- assemble the child's version-0 snapshot from the same state ------
+    child_initial_state = initial_state(new_sc)
+    now = datetime.now(timezone.utc)
+    child_snapshot = _build_snapshot(
+        new_sc,
+        child_initial_state,
+        version=0,
+        stage=0,
+        action_ids=[],
+        anchor_observations=[],
+        chain_observations=[],
+        committed_at=now,
+    )
+
+    scenario_blob = json.dumps(
+        req.model_dump(mode="json", exclude={"plan", "expected_version"}),
+        separators=(",", ":"),
+    )
+
+    child_id = uuid.uuid4().hex
+
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _load_execution(conn, execution_id)
+        current_version = row["current_version"]
+
+        # Authoritative guard: the optimistic version must still match.
+        if req.expected_version != current_version:
+            raise CommitRejected(
+                _conflict(
+                    "version_conflict",
+                    f"expected_version {req.expected_version} does not match "
+                    f"the current version {current_version} of execution "
+                    f"'{execution_id}'; a stage committed concurrently, so "
+                    f"the handoff is rejected and no child execution was "
+                    f"created.",
+                    expected_version=current_version,
+                    current_version=current_version,
+                )
+            )
+
+        # Only one handoff may ever win: a completed first handoff blocks all
+        # later ones, which leave no child records.
+        if bool(row["handed_off"]):
+            raise CommitRejected(
+                CommitConflict(
+                    reason="handoff_already_exists",
+                    message=(
+                        f"execution '{execution_id}' already handed off to "
+                        f"'{row['child_execution_id']}' at version "
+                        f"{current_version}; a second handoff is rejected and "
+                        f"creates no successor."
+                    ),
+                    expected_version=current_version,
+                    current_version=current_version,
+                    child_execution_id=row["child_execution_id"],
+                )
+            )
+
+        # A fully finished rotation has no unfinished work to continue.
+        stage_count = row["stage_count"]
+        if current_version >= stage_count:
+            raise CommitRejected(
+                _conflict(
+                    "execution_already_finished",
+                    f"execution '{execution_id}' has already committed all "
+                    f"{stage_count} stage(s); a handoff is only allowed while "
+                    f"the rotation is still unfinished.",
+                    expected_version=current_version,
+                    current_version=current_version,
+                )
+            )
+
+        # Insert the child first (inside this same transaction): a failure
+        # rolls back everything, including the not-yet-marked parent.
+        _insert_new_execution(
+            conn,
+            execution_id=child_id,
+            scenario_blob=scenario_blob,
+            plan_blob=_plan_blob(new_sc, batches),
+            stage_count=len(batches),
+            initial_snapshot=child_snapshot,
+            now=now,
+            origin=(execution_id, current_version, now),
+        )
+
+        # Mark the parent handed off, conditional on still being at the
+        # expected version: the final optimistic-lock guarantee against a
+        # concurrently committed stage.
+        cur = conn.execute(
+            "UPDATE plan_executions "
+            "SET handed_off = 1, child_execution_id = ?, handed_off_at = ? "
+            "WHERE execution_id = ? AND current_version = ? "
+            "AND handed_off = 0",
+            (child_id, now.isoformat(), execution_id, current_version),
+        )
+        if cur.rowcount != 1:
+            raise CommitRejected(
+                _conflict(
+                    "version_conflict",
+                    f"execution '{execution_id}' changed concurrently while "
+                    f"the handoff was being committed; no child execution was "
+                    f"created.",
+                )
+            )
+        conn.execute("COMMIT")
+    except CommitRejected:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    # Re-read both sides after commit for the response.
+    parent_status = get_execution(execution_id)
+    child_status = get_execution(child_id)
+    return ExecutionHandoffSuccess(parent=parent_status, child=child_status)

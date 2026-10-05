@@ -1795,6 +1795,71 @@ class ExecutionRegisterRequest(PlanRequest):
     )
 
 
+class ExecutionHandoffRequest(PlanRequest):
+    """A mid-execution handoff: a new scenario plus its continuation plan.
+
+    The request is made against an existing (still unfinished) execution.
+    The new scenario's initial trust anchors, every endpoint's current chain
+    and the required communication relationships must equal the parent
+    execution's latest committed snapshot — that recorded progress is the
+    starting point of the new execution. Any certificate id reused from the
+    parent scenario must keep identical certificate attributes. The new plan
+    must contain at least one stage and must keep every relationship
+    connected after each stage.
+    """
+
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description="The parent execution version this handoff is based on "
+                    "(its current version at request time). A mismatch — for "
+                    "example because another stage just committed — rejects "
+                    "the whole handoff with 409 and creates no child record.",
+    )
+    plan: list[ExecutionStage] = Field(
+        ...,
+        min_length=1,
+        description="The continuation plan for the new execution: stages "
+                    "numbered consecutively from 1, every action of the new "
+                    "scenario scheduled exactly once; no-op empty stages "
+                    "allowed. At least one stage is required.",
+    )
+
+
+class ExecutionOrigin(BaseModel):
+    """Where a handoff-created execution came from (child-side lineage)."""
+
+    kind: Literal["handoff"] = "handoff"
+    parent_execution_id: str = Field(
+        ...,
+        description="The earlier execution whose latest committed snapshot "
+                    "this execution's version-0 snapshot starts from.",
+    )
+    parent_version: int = Field(
+        ...,
+        ge=0,
+        description="Version of the parent snapshot forked from.",
+    )
+    handed_off_at: datetime
+
+
+class ExecutionHandoffRecord(BaseModel):
+    """The handoff taken from an execution (parent-side lineage)."""
+
+    child_execution_id: str = Field(
+        ...,
+        description="The new execution registered from this execution's "
+                    "latest committed snapshot; it starts at version 0.",
+    )
+    parent_version: int = Field(
+        ...,
+        ge=0,
+        description="Version of the snapshot the child started from (equal "
+                    "to this execution's current version at handoff time).",
+    )
+    handed_off_at: datetime
+
+
 class CommitAnchorObservation(BaseModel):
     """Field observation of one client trust edge at commit time.
 
@@ -1973,6 +2038,26 @@ class ExecutionStatus(BaseModel):
                     "plan (including trailing no-op stages) is finished.",
     )
     finished: bool
+    handed_off: bool = Field(
+        default=False,
+        description="True once a later execution has taken over from this "
+                    "execution's latest snapshot. A handed-off execution can "
+                    "no longer accept new stage commits; idempotent replay of "
+                    "already committed stages is still allowed and the record "
+                    "(including exports) stays readable.",
+    )
+    origin: Optional[ExecutionOrigin] = Field(
+        default=None,
+        description="Set when this execution was created by a handoff: the "
+                    "parent execution and the snapshot version it started "
+                    "from; null for a normally registered execution.",
+    )
+    handoff: Optional[ExecutionHandoffRecord] = Field(
+        default=None,
+        description="Set when this execution has handed off to a successor: "
+                    "the child execution id and the snapshot version it "
+                    "started from; null otherwise.",
+    )
     snapshots: list[StageSnapshot] = Field(
         ..., description="Every saved snapshot, version 0 first, oldest to newest."
     )
@@ -1990,8 +2075,14 @@ class CommitConflict(BaseModel):
                     "re-submitted with different content), "
                     "action_set_mismatch (the committed action set is not "
                     "exactly the plan stage), observation_mismatch (a field "
-                    "observation contradicts the computed state), or a trust "
-                    "replay code (untrusted_root / issuer_mismatch / "
+                    "observation contradicts the computed state), "
+                    "execution_already_handed_off (a successor execution has "
+                    "taken over, so no new stage may commit), "
+                    "execution_already_finished (handoff against an execution "
+                    "that already finished its plan), or "
+                    "handoff_already_exists (the execution already handed off "
+                    "to another successor), or a trust replay code "
+                    "(untrusted_root / issuer_mismatch / "
                     "action_not_allowed_at_stage / "
                     "contradictory_actions_same_stage).",
     )
@@ -2011,6 +2102,87 @@ class CommitConflict(BaseModel):
         default=None,
         description="For observation_mismatch: the offending observation "
                     "plus the expected value.",
+    )
+    child_execution_id: Optional[str] = Field(
+        default=None,
+        description="For handoff_already_exists: the successor execution id "
+                    "the first handoff created.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mid-execution handoff to a new plan
+# POST /plan-executions/{id}/handoffs
+# ---------------------------------------------------------------------------
+
+
+HandoffMismatchKind = Literal[
+    "trust_anchor_mismatch",
+    "endpoint_chain_mismatch",
+    "relationship_mismatch",
+    "certificate_attribute_mismatch",
+]
+
+
+class HandoffMismatch(BaseModel):
+    """One way the new scenario diverges from the parent's latest snapshot."""
+
+    kind: HandoffMismatchKind
+    message: str
+    client_id: Optional[str] = Field(
+        default=None,
+        description="For trust_anchor_mismatch / relationship_mismatch.",
+    )
+    anchor_cert_id: Optional[str] = Field(
+        default=None, description="For trust_anchor_mismatch."
+    )
+    endpoint_id: Optional[str] = Field(
+        default=None,
+        description="For endpoint_chain_mismatch / relationship_mismatch.",
+    )
+    cert_id: Optional[str] = Field(
+        default=None, description="For certificate_attribute_mismatch."
+    )
+    expected: Optional[Any] = Field(
+        default=None,
+        description="The value the parent snapshot/scenario records.",
+    )
+    found: Optional[Any] = Field(
+        default=None, description="The value the handoff request carries."
+    )
+
+
+class HandoffValidationErrorDetail(BaseModel):
+    """422 body for a handoff whose new scenario is not anchored at the
+    parent's latest committed snapshot (or reuses a certificate id with
+    different attributes)."""
+
+    error: Literal["handoff_snapshot_mismatch"] = "handoff_snapshot_mismatch"
+    message: str
+    parent_execution_id: str
+    parent_version: int
+    mismatches: list[HandoffMismatch] = Field(
+        ...,
+        description="Every recorded divergence, stably sorted by kind and "
+                    "the object it concerns.",
+    )
+
+
+class ExecutionHandoffSuccess(BaseModel):
+    """Result of an atomic handoff: the unchanged parent and the new child."""
+
+    status: Literal["ok"] = "ok"
+    parent: ExecutionStatus = Field(
+        ...,
+        description="The source execution after being marked handed off. Its "
+                    "snapshots and version are unchanged; it can no longer "
+                    "accept new stage commits.",
+    )
+    child: ExecutionStatus = Field(
+        ...,
+        description="The new execution starting at version 0 from the "
+                    "parent's latest snapshot, carrying the new scenario and "
+                    "continuation plan.",
     )
 
 
@@ -2083,6 +2255,18 @@ class ExecutionExport(BaseModel):
     )
     finished: bool
     created_at: datetime
+    origin: Optional[ExecutionOrigin] = Field(
+        default=None,
+        description="For an execution created by a handoff: the parent "
+                    "execution and the snapshot version it forked from. The "
+                    "version-0 commit is that snapshot.",
+    )
+    handoff: Optional[ExecutionHandoffRecord] = Field(
+        default=None,
+        description="When this execution handed off to a successor: the "
+                    "child execution id and the snapshot version it started "
+                    "from; null otherwise.",
+    )
     scenario: PlanRequest = Field(
         ..., description="The scenario stored verbatim at registration."
     )
@@ -2193,6 +2377,17 @@ class ExecutionVerificationResult(BaseModel):
         default=None,
         description="The first (and only reported) failing version; null when "
                     "every exported version is internally consistent.",
+    )
+    origin: Optional[ExecutionOrigin] = Field(
+        default=None,
+        description="Lineage copied from the verified package when the "
+                    "exported execution was itself created by a handoff: "
+                    "where its version-0 snapshot came from.",
+    )
+    handoff: Optional[ExecutionHandoffRecord] = Field(
+        default=None,
+        description="Lineage copied from the verified package when the "
+                    "exported execution handed off to a successor.",
     )
     scope: str = Field(
         default=(

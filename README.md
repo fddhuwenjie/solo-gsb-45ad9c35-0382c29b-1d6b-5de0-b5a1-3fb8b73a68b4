@@ -37,12 +37,17 @@ OCSP 响应是否由签发者（或其授权响应证书）签名、状态为 go
 值与全部通信关系，全部通过才推进版本并保存阶段快照。提交带
 `expected_version` 乐观锁，并发/过期提交返回 409 且不留部分进度，已完成阶段
 的相同重复提交幂等返回同一份快照。
-还可把某执行记录**导出为单一完整版本的自包含复核包**
+另可把某执行记录**导出为单一完整版本的自包含复核包**
 （`GET /plan-executions/{id}/export`），由**另一实例**在不访问原 SQLite 的
 情况下独立回放已提交前缀（`POST /execution-verifications`）：逐阶段核对动作、
 现场观测、信任锚、端点链快照与全部通信关系，空阶段也核对；发现缺失、重复、
 乱序或内容不符时报告首个出错阶段与机器可读原因且不再继续回放；未执行完时
 明确返回已核对版本与下一阶段；核验结论只说明包内一致性，不证明来源真实性。
+轮换尚未执行完却需要改用新计划时，可在任一时间点**接棒**
+（`POST /plan-executions/{id}/handoffs`）：以原执行最新快照为新执行版本 0 的
+起点，原子地登记新执行并把旧执行标记为已接棒；新场景的初始信任锚、端点当前
+链与必连关系必须与该快照逐项一致，沿用的证书 ID 不得改写证书属性，新计划经
+逐阶段回放验证后才落账。
 
 ## 一键启动
 
@@ -1154,6 +1159,104 @@ curl -s -X POST http://another-instance:8080/execution-verifications \
 > 核验结论**只说明包内一致性**（提交前缀在登记场景与原计划下确实确定性地回放为
 > 包内的观测与快照），**不冒充来源真实性或对端身份证明**——导出方身份与传输
 > 可信应由调用方在传输/签名层另行保证（响应的 `scope` 字段始终明示这一界限）。
+
+#### 5. `POST /plan-executions/{execution_id}/handoffs` — 未执行完时接棒到新计划
+
+轮换执行到一半（编排器决定改走新计划、换用新叶、但已落账阶段不可回退）时，让
+**已落账的进度成为新执行的起点**。请求携带原 `execution_id`、`expected_version`
+（乐观锁，即接棒所基于的原执行版本）、一个**完整的新场景**以及**至少一段**的
+后续计划：
+
+```bash
+# 前置：登记原执行，并提交阶段 1（先增信；端点仍提供旧链）
+EID=$(curl -s -X POST http://localhost:8080/plan-executions \
+  -H 'Content-Type: application/json' \
+  --data @examples/execution_register_request.json | python3 -c 'import sys,json;print(json.load(sys.stdin)["execution_id"])')
+
+curl -s -X POST "http://localhost:8080/plan-executions/$EID/stages" \
+  -H 'Content-Type: application/json' \
+  --data @examples/execution_commit_stage1.json >/dev/null
+
+# 接棒：以版本 1 的快照为新执行起点，改用 leaf-alt 续策
+curl -s -X POST "http://localhost:8080/plan-executions/$EID/handoffs" \
+  -H 'Content-Type: application/json' \
+  --data @examples/execution_handoff_request.json
+```
+
+新场景的**起点必须与原执行最新快照逐项一致**：
+
+- **初始信任锚**：新场景 `trust_anchors` 必须恰好等于快照的完整信任锚集合；
+- **端点当前链**：每个端点的 `current_chain` 必须等于快照中的现场链，端点集合
+  不得增删（新计划的 `target_chain`、动作可自由重定）；
+- **必连通信关系**：`relationships` 集合不得改变；
+- **沿用证书 ID 不得改写属性**：凡复用原场景 `cert_id` 的证书，其
+  `subject` / `issuer` / `not_valid_before` / `not_valid_after` 必须完全一致；
+  需要新证书就用新的 `cert_id`（如示例中的 `leaf-alt`）。
+
+服务先做结构校验并**完整回放**新计划：初始状态（即该快照）必须满足全部通信
+关系，且每段结束后所有关系仍有有效信任路径。全部通过后在**单个 SQLite
+事务**（`BEGIN IMMEDIATE`）内：
+
+1. 把旧执行标记为**已接棒**（条件更新：仍处于 `expected_version` 且此前未接棒
+   才生效），记录新执行 ID 与接棒时间；
+2. 登记一个**全新的执行**，其版本 0 初始快照**直接取自该快照**（信任锚、端点
+   链、关系状态一致），携带新场景与新计划，`origin` 指回
+   `{parent_execution_id, parent_version}`。
+
+两者**要么同时落账，要么都不改变**。成功返回 `201`，体含 `parent`（标记后的
+旧执行，版本与快照历史不变）与 `child`（版本 0 的新执行）两份完整状态：
+
+```json
+{
+  "status": "ok",
+  "parent": {
+    "execution_id": "9f2c...", "version": 1, "finished": false,
+    "handed_off": true,
+    "handoff": {"child_execution_id": "7af1...", "parent_version": 1,
+                "handed_off_at": "2026-10-05T..."},
+    "snapshots": ["...版本 0/1 快照原样保留..."]
+  },
+  "child": {
+    "execution_id": "7af1...", "version": 0, "stage_count": 2,
+    "next_stage": 1, "finished": false, "handed_off": false,
+    "origin": {"kind": "handoff", "parent_execution_id": "9f2c...",
+               "parent_version": 1, "handed_off_at": "2026-10-05T..."},
+    "snapshots": [{"version": 0, "...": "从父执行版本 1 快照起步..."}]
+  }
+}
+```
+
+**冲突与并发（均为 409，失败不留任何子记录）**：
+
+| 失败码 | 含义 |
+| --- | --- |
+| `version_conflict` | `expected_version` 与旧执行当前版本不符——典型为接棒请求发出后旧执行**刚提交了下一阶段**；刷新版本、以最新快照为起点重新构造接棒请求后重试 |
+| `handoff_already_exists` | 旧执行**已有接棒先完成**；响应 `child_execution_id` 指向首个后继，后来的接棒不再产生新执行 |
+| `execution_already_finished` | 旧执行已提交完整个计划，没有未完成的轮换可接续（注：接棒要求新计划至少一段，正常 API 路径下已完成执行无法构造合法接棒，此码为纵深防御） |
+
+新场景与快照不一致（信任锚 / 端点链 / 通信关系）或沿用证书改了属性时返回
+**422**，`detail.error` 为 `handoff_snapshot_mismatch`，`mismatches` 按
+`trust_anchor_mismatch` → `endpoint_chain_mismatch` → `relationship_mismatch`
+→ `certificate_attribute_mismatch` 稳定列出**全部**分歧及期望/实际值；未知
+`execution_id` 为 404；新计划回放断链则与登记接口同为 409（如
+`untrusted_root`）。
+
+**接棒后的行为**：
+
+- 旧执行**不能再提交未完成阶段**：对下一阶段的提交返回 409
+  `execution_already_handed_off`（响应带 `child_execution_id`），不留部分进度；
+- 旧执行**已提交阶段的同内容重试仍按原规则处理**：以当前版本号重发完全相同的
+  阶段提交依旧幂等返回原快照；不同内容仍为 `duplicate_payload_mismatch`；
+  过期 `expected_version` 仍先报 `version_conflict`；
+- 新执行是**普通执行**：沿用登记/提交/查询/导出/异地核验全部接口；它自身也可
+  在未完成时再次接棒，形成多代血缘。
+
+**来源与去向可追踪**：`GET /plan-executions/{id}` 与导出包均带血缘——
+被接棒的旧执行有 `handoff`（去向），接棒产生的执行有 `origin`（来源）。旧执行
+及其导出在接棒后**仍可读取**，仍可 POST 到 `/execution-verifications`
+**异地核验**；核验结果原样回显 `origin` / `handoff` 字段（核验仍只证明包内
+一致性）。普通的登记（`POST /plan-executions`）与阶段提交接口、Docker Compose
+启动方式均保持不变。
 
 ## 请求模型
 

@@ -122,6 +122,8 @@ def _result(
         next_stage=None if finished else verified_version + 1,
         finished=finished,
         mismatch=mismatch,
+        origin=pkg.origin,
+        handoff=pkg.handoff,
     )
 
 
